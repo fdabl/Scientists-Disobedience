@@ -1,0 +1,1140 @@
+---
+title: "Data Analysis: Out of the Lab and into the Streets?"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: Fabian Dablander
+output:
+  html_document:
+    toc: true
+    theme: united
+    code_folding: show
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, eval = TRUE,
+  fig.align = 'center', fig.width = 10, fig.height = 7, dpi = 300,
+  out.width='100%', out.height='100%'
+)
+```
+
+<!-- avoid border around images -->
+<style>
+    img {
+        border: 0;
+    }
+</style>
+
+# Introduction
+This document includes the statistical analyses reported in the paper Dablander, F.<sup>&#11089;</sup>, Sachisthal, M.<sup>&#11089;</sup>, & Aron, A. (under review) Out of the Labs and into the Streets? Effects of Climate Protests by Environmental Scientists. *Royal Society Open Science*.
+
+# Data preparation
+We prepare the data and then test the above hypotheses.
+
+```{r}
+library(brms)
+library(dplyr)
+library(knitr)
+library(tidyr)
+library(readr)
+library(scales)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+library(BayesFactor)
+library(marginaleffects)
+source('helpers.R')
+
+df_text <- read_csv('data/dat_text.csv')
+df <- read_csv('data/dat_num_all.csv')
+demographics <- read.csv('data/demographics_all.csv')
+df <- df %>%
+  rename(Submission.id = SESSION_ID) %>% 
+  left_join(
+    demographics %>%
+      rename(political_affiliation = U.s..political.affiliation) %>% 
+      select(Submission.id, Age, Sex, political_affiliation),
+    by = 'Submission.id'
+  ) %>% 
+  mutate(
+    Protest = case_when(
+      grepl('Legal', condition) ~ 'Legal March',
+      grepl('CD', condition) ~ 'Civil Disobedience'
+    ),
+    Protest = factor(Protest, levels = c('Civil Disobedience', 'Legal March')),
+
+    Engagement = case_when(
+      grepl('None', condition) ~ 'Control',
+      grepl('Endorse', condition) ~ 'Support',
+      grepl('Join', condition) ~ 'Engaged'
+    ),
+    # Engagement = factor(Engagement, levels = c('Engaged', 'Support', 'Control')),
+    Engagement = factor(Engagement, levels = c('Control', 'Support', 'Engaged')),
+
+    PolicySupport = as.numeric(PolicySupport),
+    ActivistSupport = as.numeric(ActivistSupport),
+    ScienceCredibility = as.numeric(ScienceCredibility),
+    SourceCredibility = as.numeric(SourceCredibility),
+    Radical = as.numeric(Radical),
+    Donation = as.numeric(Donation_1),
+
+    PoliticalAffiliation = as.numeric(PoliticalAffiliation)
+  ) %>% 
+  filter(
+    # !(political_affiliation %in% c('CONSENT_REVOKED', 'DATA_EXPIRED')),
+    Progress == 100 # Remove 10 people who did not finish the survey
+  ) %>% 
+  mutate(
+    political_affiliation = ifelse(
+      PoliticalAffiliation %in% c(1, 2), 'Democrat',
+      ifelse(
+        PoliticalAffiliation %in% c(4, 5), 'Republican', 'Independent'
+      )
+    ),
+    Politics = factor(political_affiliation, levels = c('Democrat', 'Republican', 'Independent'))
+  )
+
+contrasts(df$Protest) <- contr.sum(levels(df$Protest))
+contrasts(df$Engagement) <- contr.sum(levels(df$Engagement))
+contrasts(df$Politics) <- contr.sum(levels(df$Politics))
+
+nrow(df)
+```
+
+We remove those participants that incorrectly answer the attention check question.
+
+```{r}
+df$AC_Protest %>% table
+df_text$AC_Protest %>% table
+```
+
+```{r}
+df <- df %>% 
+  filter(
+    (Protest == 'Civil Disobedience' & AC_Protest == '2') |
+    (Protest == 'Legal March'        & AC_Protest == '1')
+  )
+```
+
+We are left with 2,875 responses.
+
+```{r}
+nrow(df)
+```
+
+We remove the users that responded incoherently or inappropriately to the open text question about what the article was about. This leaves us with 2,856 responses.
+
+```{r}
+df_open <- read.csv('data/openAnswers_coded.csv') %>% filter(Usable == 1)
+
+# Additional check from second coder
+df_check <- df_open %>% filter(Check == 1)
+remove_responseids <- df_check$ResponseId[-c(4, 6)]
+df <- df %>%
+  left_join(df_open, by = 'ResponseId') %>% 
+  filter(Usable == 1, !(ResponseId %in% remove_responseids))
+
+nrow(df)
+```
+
+
+```{r}
+# Prepare sub-set of data for later analyses
+df_march <- df %>% 
+  filter(Protest == 'Legal March') %>% 
+  mutate(Y = Radical)
+
+df_civil <- df %>% 
+  filter(Protest == 'Civil Disobedience') %>% 
+  mutate(Y = Radical)
+
+df_source <- df %>% 
+  filter(!is.na(SourceCredibility)) %>% 
+  mutate(
+    Y = SourceCredibility,
+    Engagement = factor(Engagement, levels = c('Support', 'Engaged'))
+  )
+
+contrasts(df_source$Engagement) <- contr.sum(levels(df_source$Engagement))
+```
+
+
+```{r, eval = FALSE, echo = FALSE}
+# Select 100 for the lottery.
+set.seed(1)
+df_lottery <- df[sample(nrow(df), size = 100), ]
+write.csv(df_lottery, 'df_lottery.csv', row.names = FALSE)
+```
+
+We fit all the models for the model-averaged exploratory analysis.
+
+```{r}
+# Not included because it is ~50 MB large
+fit_all <- readRDS('models/models_scaled.RDS')
+
+# Not included because it is ~300 MB large
+if (file.exists('models/fit_all_averaging_scaled.RDS')) {
+  
+  # For model-averaging later
+  fit_all_averaging <- readRDS('models/fit_all_averaging_scaled.RDS')
+  fit_policy <- fit_all_averaging$fit_policy
+  fit_activist <- fit_all_averaging$fit_activist
+  fit_radical <- fit_all_averaging$fit_radical
+  fit_source <- fit_all_averaging$fit_source
+  fit_science <- fit_all_averaging$fit_science
+  
+} else {
+  
+  set.seed(1)
+  fit_policy <- get_logml_all_parallel(
+    df %>% mutate(Y = PolicySupport), fit_all,
+    iter = 4000, cores = 1, chains = 2
+  )
+  
+  set.seed(1)
+  fit_activist <- get_logml_all_parallel(
+    df %>% mutate(Y = ActivistSupport), fit_all,
+    iter = 4000, cores = 1, chains = 2
+  )
+  
+  set.seed(1)
+  fit_radical <- get_logml_all_parallel(
+    df %>% mutate(Y = Radical), fit_all,
+    iter = 4000, cores = 1, chains = 2
+  )
+  
+  set.seed(1)
+  fit_source <- get_logml_all_parallel(
+    df_source, fit_all,
+    iter = 4000, cores = 1, chains = 2, recompile = TRUE
+  )
+  
+  set.seed(1)
+  fit_science <- get_logml_all_parallel(
+    df %>% mutate(Y = ScienceCredibility), fit_all,
+    iter = 4000, cores = 1, chains = 2
+  )
+  
+  fit_all_averaging <- list(
+    'fit_policy' = fit_policy,
+    'fit_activist' = fit_activist,
+    'fit_radical' = fit_radical,
+    'fit_source' = fit_source,
+    'fit_science' = fit_science
+  )
+  
+  saveRDS(fit_all_averaging, 'models/fit_all_averaging_scaled.RDS')
+}
+```
+
+# Confirmatory analysis
+## Policy support
+```{r}
+fit <- fit_policy$fit_updated[[5]]
+logmls_policy <- fit_policy$logmls
+
+df_effects_policy <- get_all_predictions(
+  fit, 'Policy support', variables = c('Engagement', 'Protest')
+)
+
+palette <- c("#E67C73", "#F2A489", "#F6E8A7", "#A3C4D4", "#5D92C7")
+p1 <- create_plot(
+  df, 'PolicySupport', 'Policy support',
+  df_effects = df_effects_policy
+)
+p1
+```
+
+### H1: Effect of protest on policy support
+Moderate evidence against effect of protest.
+
+```{r}
+h1_bfs <- get_bf_matrix(logmls_policy[c(1, 3)])
+h1_bfs
+```
+
+### H4: Effect of engagement on policy support
+Strong evidence of no effect of engagement on policy support.
+
+```{r}
+h4_bfs <- get_bf_matrix(
+  c(logmls_policy[c(1, 2)],
+    log(get_directed_bf(fit_policy$fit_updated[[2]])) + logmls_policy[2]
+  )
+)
+h4_bfs
+```
+
+## Activist support
+```{r}
+fit <- fit_activist$fit_updated[[5]]
+logmls_activist <- fit_activist$logmls
+
+df_effects_activist <- get_all_predictions(
+  fit, 'Activist support', variables = c('Engagement', 'Protest')
+)
+
+p2 <- create_plot(
+  df, 'ActivistSupport',
+  'Activist support',
+  df_effects = df_effects_activist
+)
+p2
+```
+
+### H2: Effect of protest on activist support
+Overwhelming evidence in favour of a difference.
+
+```{r}
+h2_bfs <- get_bf_matrix(
+  c(logmls_activist[c(1, 3)],
+    logmls_activist[3] + log(get_directed_bf(
+      fit_activist$fit_updated[[3]], groups = 2,
+      type = 'decreasing', pars = 'Protest'
+    ))
+  )
+)
+h2_bfs
+```
+
+### H5: Effect of engagement on activist support
+Strong evidence in favour of no effect, although it's a bit lower compared to the directed hypothesis.
+
+```{r}
+h5_bfs <- get_bf_matrix(
+  c(logmls_activist[c(1, 2)],
+    logmls_activist[2] + log(get_directed_bf(
+      fit_activist$fit_updated[[2]]
+    ))
+  )
+)
+h5_bfs
+```
+
+## Perceived radicalness of protest
+```{r}
+fit <- fit_radical$fit_updated[[5]]
+logmls_radical <- fit_radical$logmls
+
+df_effects_radical <- get_all_predictions(
+  fit, 'Perceived radicalness', variables = c('Engagement', 'Protest')
+)
+
+p3 <- create_plot(
+  df, 'Radical',
+  'Perceived radicalness',
+  df_effects = df_effects_radical,
+  lo = 'Not at all radical', hi = 'Extremely radical'
+)
+p3
+```
+
+### H3: Effect of protest on perceived radicalness
+Overwhelming effect of higher perceived radicalness for civil disobedience.
+
+```{r}
+h3_bfs <- get_bf_matrix(
+  c(logmls_radical[c(1, 3)],
+    logmls_radical[3] + log(get_directed_bf(
+      fit_radical$fit_updated[[3]], groups = 2,
+      type = 'increasing', pars = 'Protest'
+    ))
+  )
+)
+h3_bfs
+```
+
+### H6: Effect of engagement on perceived radicalness for legal march
+Strong evidence evidence in favour of no effect of engagement.
+
+```{r}
+h6_test <- get_logml_all(
+  df_march,
+  list('null' = fit_all[[1]], 'full' = fit_all[[2]])
+)
+
+# All marginal likelihoods
+logmls_all <- c(
+  h6_test$logmls,
+  h6_test$logmls[2] + log(get_directed_bf(h6_test$fit_updated$full, type = 'decreasing'))
+)
+
+h6_bfs <- get_bf_matrix(logmls_all)
+h6_bfs
+```
+
+### H7: Effect of engagement on perceived radicalness for civil disobedience
+Weak evidence evidence in favour of no effect of engagement.
+
+```{r}
+h7_test <- get_logml_all(
+  df_civil,
+  list('null' = fit_all[[1]], 'full' = fit_all[[2]])
+)
+
+# All marginal likelihoods
+logmls_all <- c(
+  h7_test$logmls,
+  h7_test$logmls[2] + log(get_directed_bf(h7_test$fit_updated$full, type = 'decreasing'))
+)
+
+h7_bfs <- get_bf_matrix(logmls_all)
+h7_bfs
+```
+
+## Source credibility
+We need to recompile the model because otherwise `marginaleffects` throws an error regarding the different factor levels for engagement being present.
+
+```{r}
+# Is small enough to be included, but also quick enough to be estimated once
+if (!file.exists('models/fit_source_full_final.RDS')) {
+  fit <- brm(
+    formula = 'Y ~ Engagement + Protest',
+    data = df_source, family = brms::cumulative('probit'),
+    prior = c(
+      prior(student_t(1, 0, 0.15), class = b),
+      prior(student_t(1, 0, 2.5), class = Intercept)
+    ), cores = 4, chains = 4, iter = 1000, save_pars = save_pars(all = TRUE)
+  )
+  
+  saveRDS(fit, 'models/fit_source_full_final.RDS')
+  
+} else {
+  fit <- readRDS('models/fit_source_full_final.RDS')
+}
+
+df_effects_source <- get_all_predictions(
+  fit, 'Source credibility', variables = c('Engagement', 'Protest')
+) %>% 
+  filter(Engagement != 'Control')
+
+p4 <- create_plot(
+  df_source, 'SourceCredibility',
+  'Source credibility',
+  df_effects = df_effects_source,
+  lo = 'Not at all', hi = 'A great deal'
+)
+p4
+```
+
+### H8: Effect of engagement on source credibility
+Weak evidence in favour of no effect.
+
+```{r}
+logmls_source <- fit_source$logmls
+h8_bfs <- get_bf_matrix(logmls_source[c(1, 2)])
+h8_bfs
+```
+
+## Science credibility
+```{r}
+fit <- fit_science$fit_updated[[5]]
+
+df_effects_science <- get_all_predictions(
+  fit, 'Science credibility', variables = c('Engagement', 'Protest')
+)
+
+p5 <- create_plot(
+  df, 'ScienceCredibility',
+  'Science credibility',
+  df_effects = df_effects_science,
+  lo = 'Not at all', hi = 'A great deal'
+)
+p5
+```
+
+### H9: Effect of engagement on science credibility
+Strong evidence for no effect of engagement. 
+
+```{r}
+logmls_science <- fit_science$logmls
+h9_bfs <- get_bf_matrix(logmls_science[c(1, 2)])
+h9_bfs
+```
+
+## Figure 1: Proportions and latent means
+```{r, fig.height = 11, fig.width = 10}
+ggsave(
+  'figures/Figure1.pdf',
+  grid.arrange(
+    p1, p2, p3, p5, p4,
+    layout_matrix = rbind(
+      c(1, 1, 2, 2),
+      c(3, 3, 4, 4),
+      c(NA, 5, 5, NA)
+    )
+  ),
+  width = 11, height = 12
+)
+```
+
+## Table 1: Summary of confirmatory results
+```{r}
+hyp_names <- c(
+  'H1: No effect of protest form on policy support',
+  'H2: Higher activist support for legal march',
+  'H3: Higher perceived radicalness for civil disobedience',
+  'H4: Higher policy support for scientist joining, then supporting, then for no engagement',
+  'H5: Higher activist support for scientist joining, then supporting, then for no engagement',
+  'H6: Legal march perceived as least radical when scientists join, then for supporting, then for no engagement',
+  'H7: Civil disobedience perceived as least radical when scientists join, then for supporting, then for no engagement',
+  'H8: No effect of type of engagement on source credibility',
+  'H9: No effect of type of engagement on science credibility'
+)
+hyp_bfs <- c(
+  h1_bfs[1, 2],
+  h2_bfs[3, 1],
+  h3_bfs[3, 1],
+  h4_bfs[3, 1],
+  h5_bfs[3, 1],
+  h6_bfs[3, 1],
+  h7_bfs[3, 1],
+  h8_bfs[1, 2],
+  h9_bfs[1, 2]
+)
+
+kable(
+  cbind(hyp_names, round(hyp_bfs, 3)),
+  col.names = c('Hypothesis', 'Bayes factor in favour of the hypothesis')
+)
+```
+
+# Exploratory analysis
+Here we show the results across political affiliation and report inclusion Bayes factors.
+
+## Policy support
+```{r, fig.height = 8}
+df_effects_policy <- get_all_predictions(
+  fit_policy$fit_updated[[19]], 'Policy support',
+  variables = c('Engagement', 'Protest', 'Politics')
+)
+
+p7 <- create_plot(
+  df, 'PolicySupport',
+  'Policy support',
+  'Expand offshore drilling',
+  political = TRUE,
+  df_effects = df_effects_policy
+)
+p7
+
+ggsave('figures/FigureS4.pdf', p7, width = 9, height = 7)
+```
+
+```{r}
+inclusion_bfs_policy_support <- get_inclusion_bayes_factors(fit_policy)
+
+kable(
+  log(inclusion_bfs_policy_support),
+  col.names = c('Effect', 'Log Inclusion Bayes factor')
+)
+```
+
+## Activist support
+```{r, fig.height = 8}
+df_effects_activist <- get_all_predictions(
+  fit_activist$fit_updated[[19]], 'Activist support',
+  variables = c('Engagement', 'Protest', 'Politics')
+)
+
+p8 <- create_plot(
+  df, 'ActivistSupport', 'Activist support',
+  political = TRUE, df_effects = df_effects_activist
+)
+p8
+ggsave('figures/FigureS5.pdf', p8, width = 9, height = 7)
+```
+
+```{r}
+inclusion_bfs_activist_support <- get_inclusion_bayes_factors(fit_activist)
+
+kable(
+  log(inclusion_bfs_activist_support),
+  col.names = c('Effect', 'Log Inclusion Bayes factor')
+)
+```
+
+## Perceived radicalness
+```{r, fig.height = 8}
+df_effects_radical <- get_all_predictions(
+  fit_radical$fit_updated[[19]], 'Perceived radicalness',
+  variables = c('Engagement', 'Protest', 'Politics')
+)
+
+p9 <- create_plot(
+  df, 'Radical', 'Perceived radicalness', 'of the protest',
+  political = TRUE, df_effects = df_effects_radical,
+  lo = 'Not at all radical', hi = 'Extremely radical'
+)
+p9
+ggsave('figures/FigureS6.pdf', p9, width = 9, height = 7)
+```
+
+```{r}
+inclusion_bfs_radical <- get_inclusion_bayes_factors(fit_radical)
+
+kable(
+  log(inclusion_bfs_radical),
+  col.names = c('Effect', 'Log Inclusion Bayes factor')
+)
+```
+
+## Source credibility
+```{r, fig.height = 8}
+# Is small enough to be included, but also quick enough to be estimated once
+if (!file.exists('models/fit_source_politics.RDS')) {
+  fit_source_full <- brm(
+    formula = 'Y ~ Engagement + Protest + Politics',
+    data = df_source, family = brms::cumulative('probit'),
+    prior = c(
+      prior(student_t(1, 0, 0.15), class = b),
+      prior(student_t(3, 0, 2.5), class = Intercept)
+    ), cores = 4, chains = 4, iter = 2000, save_pars = save_pars(all = TRUE)
+  )
+  
+  saveRDS(fit_source_full, 'models/fit_source_politics.RDS')
+  
+} else {
+  fit_source_full <- readRDS('models/fit_source_politics.RDS')
+}
+
+df_effects_source <- get_all_predictions(
+  fit_source_full, 'Source credibility',
+  variables = c('Engagement', 'Protest', 'Politics')
+)
+
+p10 <- create_plot(
+  df %>% filter(Engagement != 'Control'),
+  'SourceCredibility',
+  'Source credibility',
+  'Trust Dr. Fraser',
+  political = TRUE, lo = 'Not at all', hi = 'A great deal',
+  df_effects = df_effects_source
+)
+  
+p10
+ggsave('figures/FigureS7.pdf', p10, width = 9, height = 7)
+```
+
+```{r}
+inclusion_bfs_source <- get_inclusion_bayes_factors(fit_source)
+
+kable(
+  log(inclusion_bfs_source),
+  col.names = c('Effect', 'Log Inclusion Bayes factor')
+)
+```
+
+## Science credibility
+```{r, fig.height = 8}
+df_effects_science <- get_all_predictions(
+  fit_science$fit_updated[[19]], 'Science credibility',
+  variables = c('Engagement', 'Protest', 'Politics')
+)
+
+p11 <- create_plot(
+  df, 'ScienceCredibility',
+  'Science credibility',
+  'Trust environmental scientists',
+  political = TRUE, df_effects = df_effects_science,
+  lo = 'Not at all', hi = 'A great deal'
+)
+p11
+ggsave('figures/FigureS8.pdf', p11, width = 9, height = 7)
+```
+
+```{r}
+inclusion_bfs_science <- get_inclusion_bayes_factors(fit_science)
+
+kable(
+  log(inclusion_bfs_science),
+  col.names = c('Effect', 'Log Inclusion Bayes factor')
+)
+```
+
+## Donation behaviour
+```{r, fig.height = 8}
+fit_donation <- anovaBF(
+  Donation ~ Protest + Engagement + Politics, data = df,
+  rscaleEffects = c('Engagement' = 0.15, 'Protest' = 0.15, 'Politics' = 0.15)
+)
+
+if (!file.exists('models/df_effects_donation.csv')) {
+  df_preds_donation <- get_df_preds_donation(fit_donation[18], df)
+  df_effects_donation <- df_preds_donation %>% 
+    group_by(Protest, Engagement, Politics) %>% 
+    summarize(
+      estimate = mean(ypred),
+      conf.low = quantile(ypred, 0.025),
+      conf.high = quantile(ypred, 0.975),
+    )
+  
+  write.csv(df_effects_donation, 'models/df_effects_donation.csv', row.names = FALSE)
+  
+} else {
+  df_effects_donation <- read.csv('models/df_effects_donation.csv')
+}
+
+df_effects_donation <- df_effects_donation %>% 
+  mutate(
+    Engagement = ifelse(Engagement == 'Support', 'Endorsed', Engagement),
+    Engagement = factor(Engagement, labels = c('Control', 'Endorsed', 'Engaged'))
+  )
+
+cols <- c('#08519c', 'gray46', '#a50f15')
+pdon <- ggplot(
+  df_effects_donation, aes(x = Engagement, y = estimate, color = Politics)) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    position = position_dodge(width = 0.70), width = 0.50, size = 1
+  ) +
+  geom_point(size = 3, position = position_dodge(width = 0.70)) +
+  theme_minimal() +
+  labs(
+    x = '',
+    y = 'Predicted values',
+    title = 'Donations across conditions'
+  ) +
+  scale_color_manual(values = cols) +
+  scale_y_continuous(limits = c(10, 40)) +
+  facet_wrap(~ Protest) +
+  theme(
+    legend.position = 'top',
+    legend.title = element_blank(),
+    strip.text = element_text(size = 12),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 14, hjust = 0.50)
+  ) +
+  guides(fill = guide_legend(reverse = TRUE))
+
+pdon
+```
+
+```{r, eval = FALSE, echo = FALSE, fig.height = 8}
+df_mean <- create_mean(df, 'Donation', political = TRUE)
+
+pdon_emp <- ggplot(df_mean, aes(x = Engagement, y = estimate)) +
+    geom_point() +
+    geom_errorbar(
+        data = df_mean, aes(x = Engagement, ymin = conf.low, ymax = conf.high),
+        inherit.aes = FALSE, width = 0.20
+    ) +
+    scale_y_continuous(limits = c(10, 40)) +
+    xlab('') +
+    ylab('Value') +
+    ggtitle('Donations across conditions') +
+    theme_minimal() +
+    facet_wrap(~ Protest + political_affiliation) +
+    theme(
+        legend.position = 'top',
+        legend.title = element_blank(),
+        strip.text = element_text(size = 12),
+        panel.grid = element_blank(),
+        plot.title = element_text(size = 14, hjust = 0.50)
+    ) +
+    guides(fill = guide_legend(reverse = TRUE))
+
+pdon_emp
+```
+
+```{r}
+inclusion_bfs_donation <- c(
+  # Main effects
+  get_bf_inclusion_donation(fit_donation, 'Engagement')[1],
+  get_bf_inclusion_donation(fit_donation, 'Protest')[1],
+  get_bf_inclusion_donation(fit_donation, 'Politics')[1],
+  
+  # Two-way interaction effects
+  get_bf_inclusion_donation(fit_donation, 'Engagement', varname2 = 'Protest')[2],
+  get_bf_inclusion_donation(fit_donation, 'Engagement', varname2 = 'Politics')[2],
+  get_bf_inclusion_donation(fit_donation, 'Protest', varname2 = 'Politics')[2],
+  
+  # Tree-way interaction effects
+  get_bf_inclusion_donation(fit_donation, 'Engagement')[3]
+)
+
+names(inclusion_bfs_donation) <- names(inclusion_bfs_science)
+
+kable(
+  log(inclusion_bfs_donation),
+  col.names = c('Effect', 'Log Inclusion Bayes factor')
+)
+```
+
+## Figure 2: Latent means across conditions
+```{r, fig.width = 10, fig.height = 10}
+set.seed(1)
+df_preds <- bind_rows(
+  get_all_predictions(fit_policy$fit_updated[[19]], outcome = 'Policy support'),
+  get_all_predictions(fit_activist$fit_updated[[19]], outcome = 'Activist support'),
+  get_all_predictions(fit_radical$fit_updated[[19]], outcome = 'Perceived radicalness'),
+  get_all_predictions(fit_science$fit_updated[[19]], outcome = 'Science credibility'),
+  get_all_predictions(fit_source_full, outcome = 'Source credibility'),
+  df_effects_donation %>% mutate(outcome = 'Donation')
+) %>% 
+  mutate(
+    Politics = factor(Politics, levels = c('Democrat', 'Independent', 'Republican')),
+    outcome = factor(
+      outcome,
+      levels = c(
+        'Policy support', 'Activist support',
+        'Perceived radicalness', 'Source credibility',
+        'Science credibility', 'Donation'
+      )
+    ),
+    panel = c(rep(1:4, each = 18), rep(5, 12), rep(16, 18))
+  )
+
+cols <- c('#08519c', 'gray46', '#a50f15')
+ppost <- ggplot(
+  df_preds, aes(x = Engagement, y = estimate, col = Politics, shape = Protest)
+) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    position = position_dodge(width = 0.70), width = 0.50, size = 1
+  ) +
+  geom_point(size = 3, position = position_dodge(width = 0.70)) +
+  theme_minimal() +
+  labs(
+    x = '',
+    y = 'Latent mean',
+    title = 'Latent means across outcomes and conditions'
+  ) +
+  scale_color_manual(values = cols) +
+  facet_wrap(~ outcome, ncol = 2, scales = 'free_y') +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.50),
+    strip.text = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.position = 'top',
+    legend.box = 'vertical',
+    legend.spacing.y = unit(-0.25, 'cm')
+  )
+
+ggsave('figures/Figure2.pdf', ppost, width = 9, height = 9)
+ppost
+```
+
+## Table 2: Summary of exploratory results
+```{r}
+varnames <- c(
+  'Policy support',
+  'Activist support',
+  'Perceived radicalness',
+  'Source credibility',
+  'Science credibility',
+  'Donation'
+)
+
+inclusion_bfs <- cbind(
+  inclusion_bfs_policy_support,
+  inclusion_bfs_activist_support,
+  inclusion_bfs_radical,
+  inclusion_bfs_source,
+  inclusion_bfs_science,
+  inclusion_bfs_donation
+)
+
+format_scientific <- function(x) {
+  if (is.numeric(x) && x > 1000) {
+    formatted <- formatC(x, format = "e", digits = 2)
+    # Replace 'e+' with ' x 10^' for the desired format
+    formatted <- gsub("e\\+0*", " x 10^", formatted)
+    formatted <- gsub("e\\-", " x 10^-", formatted)
+    return(formatted)
+  }
+  return(as.character(x))
+}
+
+colnames(inclusion_bfs) <- varnames
+df_inclusion <- data.frame(round(inclusion_bfs, 3)) %>% tibble::rownames_to_column()
+colnames(df_inclusion) <- c('Factor', str_replace_all(colnames(df_inclusion)[-1], '\\.', ' '))
+
+# Apply the formatting function to the data frame
+df_inclusion[, -1] <- as.data.frame(lapply(df_inclusion[, -1], function(column) {
+  sapply(column, format_scientific)
+}))
+
+kable(df_inclusion)
+```
+
+# Supplementary Analysis
+## Sensitivity analysis: Confirmatory results
+```{r}
+prior_widths <- seq(0.10, 0.50, 0.02) / 2
+
+if (!file.exists('results/sensitivity_confirmatory.RDS')) {
+    
+  # Policy support
+  h1_sens <- run_sensitivity(
+    df %>% mutate(Y = PolicySupport),
+    list('null' = fit_all[[1]], 'full' = fit_all[[3]]),
+    prior_widths
+  )
+  
+  h4_sens <- run_sensitivity(
+    df %>% mutate(Y = PolicySupport),
+    list('null' = fit_all[[1]], 'full' = fit_all[[2]]),
+    prior_widths, includes_ordered = TRUE,
+    groups = 3, pars = 'Engagement', type = 'increasing'
+  )
+  
+  # Activist support
+  h2_sens <- run_sensitivity(
+    df %>% mutate(Y = ActivistSupport),
+    list('null' = fit_all[[1]], 'full' = fit_all[[3]]),
+    prior_widths
+  )
+  
+  h5_sens <- run_sensitivity(
+    df %>% mutate(Y = ActivistSupport),
+    list('null' = fit_all[[1]], 'full' = fit_all[[2]]),
+    prior_widths,
+    includes_ordered = TRUE,
+    groups = 3, pars = 'Engagement', type = 'increasing'
+  )
+  
+  # Perceived radicalness
+  h3_sens <- run_sensitivity(
+    df %>% mutate(Y = Radical),
+    list('null' = fit_all[[1]], 'full' = fit_all[[3]]),
+    prior_widths
+  )
+  
+  h6_sens <- run_sensitivity(
+    df_march,
+    list('null' = fit_all[[1]], 'full' = fit_all[[2]]),
+    prior_widths,
+    groups = 3, pars = 'Engagement', type = 'decreasing'
+  )
+  
+  h7_sens <- run_sensitivity(
+    df_civil,
+    list('null' = fit_all[[1]], 'full' = fit_all[[2]]),
+    prior_widths,
+    groups = 3, pars = 'Engagement', type = 'decreasing'
+  )
+  
+  # Source credibility
+  h8_sens <- run_sensitivity(
+    df_source,
+    list('null' = fit_all[[1]], 'full' = fit_all[[2]]),
+    prior_widths
+  )
+  
+  # Science credibility
+  h9_sens <- run_sensitivity(
+    df %>% mutate(Y = ScienceCredibility),
+    list('null' = fit_all[[1]], 'full' = fit_all[[2]]),
+    prior_widths
+  )
+  
+  sens_all <- list(
+    'h1_sens' = h1_sens,
+    'h2_sens' = h2_sens,
+    'h3_sens' = h3_sens,
+    'h4_sens' = h4_sens,
+    'h5_sens' = h5_sens,
+    'h6_sens' = h6_sens,
+    'h7_sens' = h7_sens,
+    'h8_sens' = h8_sens,
+    'h9_sens' = h9_sens
+  )
+  
+  saveRDS(sens_all, 'results/sensitivity_confirmatory.RDS')
+} else {
+  sens_all <- readRDS('results/sensitivity_confirmatory.RDS')
+}
+```
+
+## Figure S2: Sensitivity analysis of confirmatory results
+```{r, fig.height = 9}
+get_bf01 <- function(bfmat) bfmat[1, 2]
+sapply(sens_all$h1_sens, get_bf01)
+
+bfs <- do.call('c', lapply(names(sens_all), function(name) {
+  sapply(sens_all[[name]], get_bf01)
+}))
+
+df_sens <- data.frame(
+  type = rep(paste0('H[', seq(9), ']'), each = length(prior_widths)),
+  prior_width = rep(prior_widths, 9),
+  bfs = bfs
+)
+
+custom_label <- function(x) {
+  ifelse(
+    abs(x) > 500 | abs(x) < 0.002,
+    formatC(x, format = 'e', digits = 1),
+    format(x, scientific = FALSE)
+  )
+}
+
+psens <- ggplot(df_sens, aes(x = prior_width * 2, y = bfs)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ type, scales = 'free_y', labeller = label_parsed) +
+  labs(
+    y = expression(BF[0*1]),
+    x = 'Prior width',
+    title = 'Bayes factor sensitivity analysis'
+  ) +
+  scale_y_continuous(labels = custom_label) +
+  theme_minimal() +
+  theme(
+    legend.position = 'top',
+    legend.title = element_blank(),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 14, hjust = 0.50)
+  )
+
+psens
+ggsave('figures/FigureS2.pdf', psens, width = 9, height = 9)
+```
+
+## Figure S3: Sensitivity analysis of exploratory results
+```{r}
+prior_widths <- seq(0.10, 0.50, 0.04) / 2
+
+policy_sens <- run_sensitivity_inclusion(
+  df %>% mutate(Y = PolicySupport),
+  fit_all,
+  prior_widths,
+  filename = 'results/policy_sens_incl.RDS'
+)
+
+activist_sens <- run_sensitivity_inclusion(
+  df %>% mutate(Y = ActivistSupport),
+  fit_all,
+  prior_widths,
+  filename = 'results/activist_sens_incl.RDS'
+)
+
+radical_sens <- run_sensitivity_inclusion(
+  df %>% mutate(Y = Radical),
+  fit_all,
+  prior_widths,
+  filename = 'results/radical_sens_incl.RDS'
+)
+
+science_sens <- run_sensitivity_inclusion(
+  df %>% mutate(Y = ScienceCredibility),
+  fit_all,
+  prior_widths,
+  filename = 'results/science_sens_incl.RDS'
+)
+
+source_sens <- run_sensitivity_inclusion(
+  df %>% mutate(Y = SourceCredibility),
+  fit_all,
+  prior_widths,
+  filename = 'results/source_sens_incl.RDS'
+)
+
+# For donation behaviour
+donation_sens <- run_sensitivity_inclusion_donation(
+  df,
+  prior_widths,
+  filename = 'results/source_donation_incl.RDS'
+)
+```
+
+```{r, fig.height = 9}
+all_sens <- rbind(
+  data.frame(policy_sens) %>% mutate(outcome = 'Policy support'),
+  data.frame(activist_sens) %>% mutate(outcome = 'Activist support'),
+  data.frame(radical_sens) %>% mutate(outcome = 'Perceived radicalness'),
+  data.frame(science_sens) %>% mutate(outcome = 'Science credibility'),
+  data.frame(source_sens) %>% mutate(outcome = 'Source credibility'),
+  data.frame(donation_sens) %>% mutate(outcome = 'Donation')
+)
+
+df_sens_all <- all_sens %>%
+  pivot_longer(cols = -c(prior_widths, outcome)) %>% 
+  mutate(
+    name = gsub('\\.', ' x ', name),
+    name = factor(
+      name,
+      levels = c(
+        'Engagement', 'Protest', 'Politics',
+        'Engagement x Protest', 'Engagement x Politics',
+        'Protest x Politics', 'Engagement x Protest x Politics'
+      )
+    ),
+    outcome = factor(
+      outcome,
+      levels = c(
+        'Policy support', 'Activist support',
+        'Perceived radicalness', 'Source credibility',
+        'Science credibility', 'Donation'
+      )
+    )
+  )
+
+cols <- c('#D55E00', '#A65628', '#029E73', '#56B4E9', '#0072B2', '#CC79A7')
+psens2 <- ggplot(df_sens_all, aes(x = prior_widths * 2, y = log(value), color = outcome)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ name, scales = 'free_y') +
+  labs(
+    y = expression('Log Inclusion' ~ BF[1*0]),
+    x = 'Prior width',
+    title = 'Sensitivity analysis for exploratory inclusion Bayes factors'
+  ) +
+  # scale_y_continuous(labels = custom_label) +
+  scale_color_manual(values = cols) +
+  theme_minimal() +
+  theme(
+    legend.position = 'top',
+    legend.title = element_blank(),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 14, hjust = 0.50),
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.box.just = "center"
+  ) + 
+  guides(colour = guide_legend(nrow = 2))
+
+psens2
+ggsave('figures/FigureS3.pdf', psens2, width = 9, height = 9)
+```
+
+## Supplementary Figure 9: Correlations between measures
+```{r}
+df_cors <- df %>% 
+  select(
+    PolicySupport, ActivistSupport, SourceCredibility, ScienceCredibility,
+    Radical, Donation, Gender, Age.x, Income, EducationLevel, PoliticalAffiliation
+  ) %>% 
+  mutate_all(as.numeric)
+
+cormat <- cor(df_cors, method = 'kendall', use = 'pairwise.complete.obs')
+diag(cormat) <- NA
+rownames(cormat) <- colnames(cormat) <- c(
+  'Policy support', 'Activist support', 'Source credibility', 'Science credibility',
+  'Perceived radicalness', 'Donation', 'Gender', 'Age', 'Income', 'Educational level',
+  'Political affiliation'
+)
+
+pdf('figures/FigureS9.pdf', width = 8, height = 8)
+corrplot(
+  cormat, method = 'color', number.cex = 0.80,
+  addCoef.col = 'black', type = 'upper',
+  tl.cex = 0.80, addrect = 20, tl.col = 'black',
+  na.label = ' ',
+  is.corr = TRUE,
+  number.digits = 2, col.lim = c(-0.80, 0.80)
+)
+dev.off()
+
+corrplot(
+  cormat, method = 'color', number.cex = 0.80,
+  addCoef.col = 'black', type = 'upper',
+  tl.cex = 0.80, addrect = 20, tl.col = 'black',
+  na.label = ' ',
+  is.corr = TRUE,
+  number.digits = 2, col.lim = c(-0.80, 0.80)
+)
+```
+
+# Session info
+```{r}
+sessionInfo()
+```
